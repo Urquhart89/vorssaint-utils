@@ -248,6 +248,7 @@ final class AppUninstaller: ObservableObject {
 
         let allowedPaths = allowedRemovalPaths
         let targetURL = target?.url
+        let targetBundleID = target?.bundleID
         let expectedTargetIdentity = targetFileIdentity
         let expectedInfoIdentity = targetInfoIdentity
         let candidateBundleIDs = Set(chosen.compactMap(\.ownerBundleID))
@@ -376,6 +377,97 @@ final class AppUninstaller: ObservableObject {
                 guard let self, self.phase == .removing else { return }
                 self.items = []
                 self.phase = .done(freed: freed, failed: failed)
+                if let targetURL {
+                    Self.removeCommandBarState(ofRemovedAppAt: targetURL, bundleID: targetBundleID)
+                }
+            }
+        }
+    }
+
+    /// After Homebrew has removed its package receipt and app artifact, clean
+    /// only the other items the person selected. The app itself is excluded so
+    /// this flow never tries to remove the same bundle twice.
+    func removeSelectedWithHomebrew(confirmation: HomebrewRemovalConfirmation) {
+        guard phase == .results, !isRemoving,
+              target?.url == confirmation.targetURL,
+              selectedHomebrewPackage?.id == confirmation.package.id,
+              Set(items.filter(\.include).map(\.id)) == confirmation.selectedIDs else {
+            QuickToolHUD.show(icon: "exclamationmark.circle",
+                              message: L10n.shared.s.uninstallerConfirmationExpired)
+            return
+        }
+        let package = confirmation.package
+        let manager = HomebrewManager.shared
+        guard manager.operation == nil else { return }
+        manager.clearLog()
+        homebrewRemovalObservation?.cancel()
+        homebrewRemovalObservation = manager.$operationStatus
+            .compactMap { $0 }
+            .filter { $0.action == .uninstall && $0.package?.id == package.id }
+            .sink { [weak self] status in
+                guard status.result != .running else { return }
+                self?.homebrewRemovalObservation?.cancel()
+                self?.homebrewRemovalObservation = nil
+                if status.result == .succeeded {
+                    self?.finishRemovalAfterHomebrew(package: package)
+                }
+            }
+        manager.uninstall(package)
+    }
+
+    private func finishRemovalAfterHomebrew(package: HomebrewPackage) {
+        guard phase == .results,
+              homebrewPackage?.id == package.id,
+              let app = items.first(where: { $0.category == .app && $0.include }),
+              let targetURL = target?.url else { return }
+        // Completion is published before the stored status stops reading as
+        // active. Clear the package before changing the guarded selection,
+        // and credit the app only after its absence is confirmed.
+        homebrewRemovedApplication = true
+        homebrewPackage = nil
+        setInclude(false, for: app.id)
+        if UninstallerSupport.isConfirmedAbsent(at: targetURL) {
+            homebrewRemovalSize = app.size
+        } else if FileManager.default.fileExists(atPath: targetURL.path) {
+            // Package removal succeeded but left the bundle. Re-select only the
+            // app so removeSelected can finish it under the package flag,
+            // counting size once when it is actually gone.
+            homebrewRemovalSize = 0
+            setInclude(true, for: app.id)
+        } else {
+            // A failed lookup is not proof of removal. Keep the failure visible.
+            homebrewRemovalSize = 0
+            homebrewRemovedApplication = false
+            setInclude(true, for: app.id)
+            phase = .done(freed: 0, failed: [app])
+            return
+        }
+        if items.contains(where: \.include) {
+            removeSelected()
+        } else {
+            phase = .done(freed: homebrewRemovalSize, failed: [])
+            Self.removeCommandBarState(ofRemovedAppAt: targetURL, bundleID: target?.bundleID)
+        }
+    }
+
+    /// A remaining copy keeps the preferences shared under its bundle ID.
+    /// Only apps with shared preferences need the folder and Spotlight scan;
+    /// path-specific state can go without it, even while the bar is disabled.
+    private static func removeCommandBarState(ofRemovedAppAt url: URL, bundleID: String?) {
+        let bundleIDs: Set<String> = bundleID.map {
+            CommandBarService.shared.hasStoredApplicationState(bundleID: $0) ? [$0] : []
+        } ?? []
+        DispatchQueue.global(qos: .utility).async {
+            guard UninstallerSupport.isConfirmedAbsent(at: url) else { return }
+            let remaining: Set<String> = bundleIDs.isEmpty ? [] : Set(InstalledApps.installedApplications(
+                includeSystemApplications: true,
+                spotlightPaths: CommandBarService.spotlightApplicationPaths())
+                .compactMap(\.bundleID))
+            DispatchQueue.main.async {
+                // A reinstall while the scan was pending must keep its state.
+                guard UninstallerSupport.isConfirmedAbsent(at: url) else { return }
+                CommandBarService.shared.removeApplicationState(
+                    bundleIDs: bundleIDs, urls: [url], remainingBundleIDs: remaining)
             }
         }
     }
